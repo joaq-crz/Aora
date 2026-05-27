@@ -8,6 +8,7 @@ import { compileSystemPrompt } from '@/services/promptCompiler';
 import {
   getGenAIClient,
   getGeminiAuthMode,
+  DEFAULT_GEMINI_MODEL,
   resolveVertexModelId,
   toVertexChatMessages,
   validateVertexConfig,
@@ -69,12 +70,12 @@ export async function POST(req: NextRequest) {
     const systemPrompt = await compileSystemPrompt(userProfile);
     const { history, lastParts } = toVertexChatMessages(body.messages);
 
-    const requestedModel = body.model || 'gemini-2.0-flash';
+    const requestedModel = body.model || DEFAULT_GEMINI_MODEL;
     const primaryModelId = resolveVertexModelId(requestedModel);
     const fallbackModelId =
-      primaryModelId === 'gemini-2.0-flash'
-        ? 'gemini-2.0-flash-lite'
-        : 'gemini-2.0-flash';
+      primaryModelId === DEFAULT_GEMINI_MODEL
+        ? 'gemini-2.5-flash-lite'
+        : DEFAULT_GEMINI_MODEL;
 
     const authMode = getGeminiAuthMode();
     console.log('[API] Auth mode:', authMode);
