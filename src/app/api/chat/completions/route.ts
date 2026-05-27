@@ -12,6 +12,7 @@ import {
   toVertexChatMessages,
   validateVertexConfig,
 } from '@/services/vertexGemini';
+import { TtsPipeline } from '@/services/ttsPipeline';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -69,12 +70,12 @@ export async function POST(req: NextRequest) {
     const systemPrompt = await compileSystemPrompt(userProfile);
     const { history, lastParts } = toVertexChatMessages(body.messages);
 
-    const requestedModel = body.model || 'gemini-2.0-flash';
+    const requestedModel = body.model || 'gemini-3.1-flash-lite';
     const primaryModelId = resolveVertexModelId(requestedModel);
     const fallbackModelId =
-      primaryModelId === 'gemini-2.0-flash'
-        ? 'gemini-2.0-flash-lite'
-        : 'gemini-2.0-flash';
+      primaryModelId === 'gemini-3.1-flash-lite'
+        ? 'gemini-3.1-flash-lite-preview'
+        : 'gemini-3.1-flash-lite';
 
     const authMode = getGeminiAuthMode();
     console.log('[API] Auth mode:', authMode);
@@ -83,9 +84,21 @@ export async function POST(req: NextRequest) {
 
     const encoder = new TextEncoder();
     let accumulatedResponse = '';
+    const enableTts = body.enable_tts !== false;
 
     const stream = new ReadableStream({
       async start(controller) {
+        const tts = enableTts
+          ? new TtsPipeline((pcm, sampleRate) => {
+              const payload = {
+                audio: {
+                  pcm: Buffer.from(pcm).toString('base64'),
+                  sampleRate,
+                },
+              };
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
+            })
+          : null;
         const sendStreamWithModel = async (modelId: string) => {
           const ai = getGenAIClient();
           const chat = ai.chats.create({
@@ -133,6 +146,7 @@ export async function POST(req: NextRequest) {
             if (!text) continue;
 
             accumulatedResponse += text;
+            tts?.push(text);
 
             const sseData = {
               choices: [
@@ -147,6 +161,10 @@ export async function POST(req: NextRequest) {
             controller.enqueue(encoder.encode(`data: ${JSON.stringify(sseData)}\n\n`));
           }
 
+          if (tts) {
+            await tts.finish();
+          }
+
           console.log('[API] Stream complete:', activeModel, `(${authMode})`);
           controller.enqueue(encoder.encode('data: [DONE]\n\n'));
 
@@ -158,6 +176,7 @@ export async function POST(req: NextRequest) {
 
           controller.close();
         } catch (error: unknown) {
+          tts?.cancel();
           console.error('Gemini stream error:', error);
 
           const errorMessage =

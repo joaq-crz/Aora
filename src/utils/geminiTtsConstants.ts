@@ -1,0 +1,1 @@
+export const GEMINI_PCM_SAMPLE_RATE = 24000;

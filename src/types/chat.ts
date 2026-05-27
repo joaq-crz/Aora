@@ -30,6 +30,8 @@ export interface ChatCompletionRequest {
   turn_id?: number;
   timestamp?: number;
   user_id?: string;
+  /** When true (default), chat SSE also streams Gemini TTS PCM chunks. */
+  enable_tts?: boolean;
 }
 
 export interface PersonaAnalysis {

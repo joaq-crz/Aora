@@ -3,6 +3,9 @@
 import { useEffect, useRef, useState } from 'react';
 import styles from './page.module.css';
 import { agoraConfig } from '@/utils/agoraConfig';
+import { GEMINI_PCM_SAMPLE_RATE } from '@/utils/geminiTtsConstants';
+import { base64ToPcm } from '@/utils/geminiLiveAudio';
+import { GeminiLiveSession, type LiveBootstrap } from '@/lib/geminiLiveSession';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -20,6 +23,10 @@ export default function Home() {
   const [lastCapturedFrame, setLastCapturedFrame] = useState<string | null>(null);
   const [isListening, setIsListening] = useState(false);
   const [isAssistantSpeaking, setIsAssistantSpeaking] = useState(false);
+  const [isLiveAgent, setIsLiveAgent] = useState(false);
+  const [liveStatus, setLiveStatus] = useState('');
+
+  const liveSessionRef = useRef<GeminiLiveSession | null>(null);
 
   const speechRecognitionRef = useRef<any>(null);
   const voiceFinalTranscriptRef = useRef<string>('');
@@ -29,10 +36,15 @@ export default function Home() {
   const agoraUidRef = useRef<number | null>(null);
   const agoraAssistantTrackRef = useRef<any>(null);
   const agoraRtcModuleRef = useRef<any>(null);
-  
+  const agoraTtsSessionRef = useRef<{
+    audioContext: AudioContext;
+    destination: MediaStreamAudioDestinationNode;
+    nextTime: number;
+  } | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const captureIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const lastCapturedFrameRef = useRef<string | null>(null);
 
   const agoraChannelName = 'hackathon-persona';
   const voiceRecognitionLang = 'en-PH'; // Taglish-friendly default
@@ -104,182 +116,213 @@ export default function Home() {
     }
   };
 
-  const publishAssistantAudioToAgora = async (blob: Blob) => {
-    const client = agoraClientRef.current;
-    if (!client) return false;
+  const getAudioContextCtor = () =>
+    (window as typeof window & { webkitAudioContext?: typeof AudioContext }).AudioContext ||
+    (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
 
-    const AgoraRTC = agoraRtcModuleRef.current;
-    if (!AgoraRTC) return false;
+  const schedulePcmChunk = async (pcm: Uint8Array, sampleRate = GEMINI_PCM_SAMPLE_RATE) => {
+    const session = agoraTtsSessionRef.current;
+    if (!session) return;
 
-    const micTrack = agoraAudioTrackRef.current;
-
-    // Unpublish previous assistant track (if any).
-    const previousAssistantTrack = agoraAssistantTrackRef.current;
-    if (previousAssistantTrack) {
+    if (session.audioContext.state === 'suspended') {
       try {
-        await client.unpublish([previousAssistantTrack]);
+        await session.audioContext.resume();
       } catch {
         // ignore
       }
-      try {
-        previousAssistantTrack.close?.();
-      } catch {
-        // ignore
-      }
-      agoraAssistantTrackRef.current = null;
     }
 
-    const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
-    if (!AudioCtx) return false;
+    const int16 = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
 
-    // Decode the ElevenLabs MP3 to PCM so we can stream it through Agora.
-    const arrayBuffer = await blob.arrayBuffer();
-    const audioContext = new AudioCtx();
-    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer.slice(0));
+    const audioBuffer = session.audioContext.createBuffer(1, float32.length, sampleRate);
+    audioBuffer.getChannelData(0).set(float32);
 
-    const source = audioContext.createBufferSource();
+    const source = session.audioContext.createBufferSource();
     source.buffer = audioBuffer;
+    source.connect(session.destination);
+    source.connect(session.audioContext.destination);
 
-    // Create a MediaStream from the decoded audio.
-    const streamDestination = audioContext.createMediaStreamDestination();
-    source.connect(streamDestination);
-    // Also play locally so the speaker hears the assistant.
-    source.connect(audioContext.destination);
+    const startAt = Math.max(session.nextTime, session.audioContext.currentTime);
+    source.start(startAt);
+    session.nextTime = startAt + audioBuffer.duration;
+  };
 
-    const mediaStreamTrack = streamDestination.stream.getAudioTracks()[0];
-    if (!mediaStreamTrack) {
-      try {
-        audioContext.close?.();
-      } catch {
-        // ignore
-      }
-      return false;
-    }
+  const beginAgoraTtsSession = async () => {
+    const client = agoraClientRef.current;
+    const AgoraRTC = agoraRtcModuleRef.current;
+    if (!client || !AgoraRTC || agoraTtsSessionRef.current) return;
 
-    const createCustomTrack = (AgoraRTC as any).createCustomAudioTrack;
-    if (!createCustomTrack) return false;
+    const AudioCtx = getAudioContextCtor();
+    if (!AudioCtx) return;
 
-    // Convert MediaStreamTrack to an Agora audio track and publish it.
-    const assistantTrack = await createCustomTrack({ mediaStreamTrack });
+    const audioContext = new AudioCtx();
+    const destination = audioContext.createMediaStreamDestination();
+    agoraTtsSessionRef.current = {
+      audioContext,
+      destination,
+      nextTime: audioContext.currentTime,
+    };
+
+    const createCustomTrack = (AgoraRTC as { createCustomAudioTrack?: Function }).createCustomAudioTrack;
+    if (!createCustomTrack) return;
+
+    const assistantTrack = await createCustomTrack({
+      mediaStreamTrack: destination.stream.getAudioTracks()[0],
+    });
     agoraAssistantTrackRef.current = assistantTrack;
 
+    const micTrack = agoraAudioTrackRef.current;
     try {
-      // Avoid mic echo/feedback for other listeners in the channel.
-      if (micTrack) {
-        try {
-          await client.unpublish([micTrack]);
-        } catch {
-          // ignore
-        }
-      }
-
+      if (micTrack) await client.unpublish([micTrack]);
       await client.publish([assistantTrack]);
     } catch (e) {
-      console.error('[Agora] assistant audio publish error:', e);
-      try {
-        assistantTrack.close?.();
-      } catch {
-        // ignore
-      }
-      agoraAssistantTrackRef.current = null;
-      try {
-        audioContext.close?.();
-      } catch {
-        // ignore
-      }
-      return false;
+      console.error('[Agora] TTS session publish error:', e);
     }
+  };
 
-    source.start(0);
+  const ensureLocalTtsSession = () => {
+    if (agoraTtsSessionRef.current) return;
 
-    return new Promise<boolean>((resolve) => {
-      source.onended = async () => {
-        try {
-          await client.unpublish([assistantTrack]);
-        } catch {
-          // ignore
-        }
-        try {
-          assistantTrack.close?.();
-        } catch {
-          // ignore
-        }
-        agoraAssistantTrackRef.current = null;
+    const AudioCtx = getAudioContextCtor();
+    if (!AudioCtx) return;
 
-        try {
-          // Restore mic publishing after assistant finishes.
-          if (micTrack) {
-            await client.publish([micTrack]);
-          }
-        } catch {
-          // ignore
-        }
+    const audioContext = new AudioCtx();
+    const destination = audioContext.createMediaStreamDestination();
+    agoraTtsSessionRef.current = {
+      audioContext,
+      destination,
+      nextTime: audioContext.currentTime,
+    };
+  };
 
-        try {
-          audioContext.close?.();
-        } catch {
-          // ignore
-        }
-        resolve(true);
-      };
+  const endAgoraTtsSession = async () => {
+    const session = agoraTtsSessionRef.current;
+    if (!session) return;
 
-      source.onerror = async () => {
-        try {
-          await client.unpublish([assistantTrack]);
-        } catch {
-          // ignore
-        }
-        try {
-          assistantTrack.close?.();
-        } catch {
-          // ignore
-        }
-        agoraAssistantTrackRef.current = null;
-        resolve(false);
-      };
+    const waitMs = Math.max(0, (session.nextTime - session.audioContext.currentTime) * 1000) + 80;
+    await new Promise((r) => setTimeout(r, waitMs));
+
+    const client = agoraClientRef.current;
+    const assistantTrack = agoraAssistantTrackRef.current;
+    const micTrack = agoraAudioTrackRef.current;
+
+    if (client && assistantTrack) {
+      try {
+        await client.unpublish([assistantTrack]);
+      } catch {
+        // ignore
+      }
+    }
+    try {
+      assistantTrack?.close?.();
+    } catch {
+      // ignore
+    }
+    agoraAssistantTrackRef.current = null;
+
+    try {
+      await session.audioContext.close();
+    } catch {
+      // ignore
+    }
+    agoraTtsSessionRef.current = null;
+
+    if (client && micTrack) {
+      try {
+        await client.publish([micTrack]);
+      } catch {
+        // ignore
+      }
+    }
+  };
+
+  const appendMessage = (role: 'user' | 'assistant', content: string) => {
+    setMessages((prev) => {
+      const last = prev[prev.length - 1];
+      if (last?.role === role) {
+        const updated = [...prev];
+        updated[updated.length - 1] = { ...last, content };
+        return updated;
+      }
+      return [...prev, { role, content, timestamp: Date.now() }];
     });
   };
 
-  const playElevenLabsTts = async (text: string) => {
-    if (!text.trim()) return;
+  const stopLiveAgent = async () => {
+    setLiveStatus('Stopping…');
+    await liveSessionRef.current?.disconnect();
+    liveSessionRef.current = null;
+    await endAgoraTtsSession();
+    setIsLiveAgent(false);
+    setIsAssistantSpeaking(false);
+    setLiveStatus('');
+  };
 
-    setIsAssistantSpeaking(true);
+  const startLiveAgent = async () => {
+    if (!localStream || !isConnected) {
+      alert('Start camera & mic first.');
+      return;
+    }
+    if (isLiveAgent) return;
+
+    setLiveStatus('Connecting…');
     try {
-      const res = await fetch('/api/tts/elevenlabs', {
+      const bootRes = await fetch('/api/live/bootstrap', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text }),
+        headers: {
+          'Content-Type': 'application/json',
+          'x-user-id': userId,
+        },
+        body: JSON.stringify({ user_id: userId }),
       });
 
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        console.warn('[TTS] ElevenLabs not available:', err?.error ?? res.statusText);
-        setIsAssistantSpeaking(false);
-        return;
+      if (!bootRes.ok) {
+        const err = await bootRes.json().catch(() => ({}));
+        throw new Error(err?.error ?? `Bootstrap failed: ${bootRes.status}`);
       }
 
-      const blob = await res.blob();
+      const bootstrap = (await bootRes.json()) as LiveBootstrap;
 
-      const published = await publishAssistantAudioToAgora(blob);
-      if (!published) {
-        // Fallback: play locally if Agora publish fails.
-        const audioUrl = URL.createObjectURL(blob);
-        const audio = new Audio(audioUrl);
-        await audio.play();
-        audio.onended = () => {
-          URL.revokeObjectURL(audioUrl);
-          setIsAssistantSpeaking(false);
-        };
-        audio.onerror = () => {
-          URL.revokeObjectURL(audioUrl);
-          setIsAssistantSpeaking(false);
-        };
-      } else {
-        setIsAssistantSpeaking(false);
+      ensureLocalTtsSession();
+      if (agoraClientRef.current) {
+        await beginAgoraTtsSession();
       }
+
+      const live = new GeminiLiveSession({
+        onOpen: () => setLiveStatus('Live — speak anytime'),
+        onClose: () => {
+          setIsLiveAgent(false);
+          setLiveStatus('');
+        },
+        onError: (msg) => {
+          console.error('[Live]', msg);
+          setLiveStatus(`Error: ${msg}`);
+        },
+        onUserTranscript: (text, finished) => {
+          if (text.trim()) appendMessage('user', text.trim());
+          if (finished) setInputText('');
+        },
+        onAssistantTranscript: (text) => {
+          if (text.trim()) appendMessage('assistant', text.trim());
+        },
+        onAssistantPcm: (pcm, rate) => {
+          void schedulePcmChunk(pcm, rate);
+        },
+        onSpeakingChange: setIsAssistantSpeaking,
+      });
+
+      await live.connect(bootstrap, localStream);
+      live.startVisionFrames(() => lastCapturedFrameRef.current);
+      liveSessionRef.current = live;
+      setIsLiveAgent(true);
+      stopVoiceInput();
     } catch (e) {
-      console.error('[TTS] error:', e);
-      setIsAssistantSpeaking(false);
+      console.error('[Live] start failed:', e);
+      await endAgoraTtsSession();
+      setLiveStatus('');
+      alert(e instanceof Error ? e.message : 'Failed to start live agent');
     }
   };
 
@@ -411,6 +454,7 @@ export default function Home() {
     // Convert to base64
     const base64Image = canvas.toDataURL('image/jpeg', 0.8);
     setLastCapturedFrame(base64Image);
+    lastCapturedFrameRef.current = base64Image;
     
     console.log('[Camera] Frame captured:', base64Image.substring(0, 50) + '...');
   };
@@ -418,6 +462,7 @@ export default function Home() {
   // Stop local media
   const stopLocalMedia = () => {
     stopVoiceInput();
+    void stopLiveAgent();
 
     if (localStream) {
       localStream.getTracks().forEach(track => track.stop());
@@ -430,6 +475,7 @@ export default function Home() {
     
     setIsConnected(false);
     setLastCapturedFrame(null);
+    lastCapturedFrameRef.current = null;
 
     if (captureIntervalRef.current) {
       clearInterval(captureIntervalRef.current);
@@ -451,25 +497,38 @@ export default function Home() {
   const sendMessage = async () => {
     if (!inputText.trim() || isLoading) return;
 
+    const text = inputText.trim();
+    setInputText('');
+
+    if (isLiveAgent && liveSessionRef.current) {
+      appendMessage('user', text);
+      liveSessionRef.current.sendText(text);
+      return;
+    }
+
     const userMessage: Message = {
       role: 'user',
-      content: inputText,
+      content: text,
       timestamp: Date.now(),
     };
 
-    setMessages(prev => [...prev, userMessage]);
-    setInputText('');
+    setMessages((prev) => [...prev, userMessage]);
     setIsLoading(true);
+    setIsAssistantSpeaking(true);
+
+    ensureLocalTtsSession();
+    if (agoraClientRef.current) {
+      await beginAgoraTtsSession();
+    }
 
     try {
       // Prepare message content (text + optional image)
-      let messageContent: any = inputText;
-      
+      let messageContent: any = text;
+
       if (lastCapturedFrame && isConnected) {
-        // Include image for multimodal analysis
         messageContent = [
-          { type: 'text', text: inputText },
-          { type: 'image_url', image_url: { url: lastCapturedFrame } }
+          { type: 'text', text },
+          { type: 'image_url', image_url: { url: lastCapturedFrame } },
         ];
       }
 
@@ -480,12 +539,13 @@ export default function Home() {
           'x-user-id': userId,
         },
         body: JSON.stringify({
-          model: 'gemini-2.0-flash',
+          model: 'gemini-3.1-flash-lite',
           messages: [...messages, { role: 'user', content: messageContent } as any].map((m) => ({
             role: m.role,
             content: m.content,
           })),
           stream: true,
+          enable_tts: true,
           user_id: userId,
           turn_id: messages.length,
           timestamp: Date.now(),
@@ -497,63 +557,73 @@ export default function Home() {
         throw new Error(`API error: ${errorText}`);
       }
 
-      // Handle SSE stream
+      // LLM + TTS multiplexed on one SSE (no per-phrase HTTP round trips)
       const reader = response.body?.getReader();
       const decoder = new TextDecoder();
       let assistantMessage = '';
+      let sseBuffer = '';
 
       if (reader) {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
 
-          const chunk = decoder.decode(value);
-          const lines = chunk.split('\n').filter(line => line.trim() !== '');
+          sseBuffer += decoder.decode(value, { stream: true });
+          const lines = sseBuffer.split('\n');
+          sseBuffer = lines.pop() ?? '';
 
           for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              const data = line.slice(6);
-              if (data === '[DONE]') continue;
+            if (!line.startsWith('data: ')) continue;
+            const data = line.slice(6).trim();
+            if (data === '[DONE]') continue;
 
-              try {
-                const parsed = JSON.parse(data);
-                const content = parsed.choices?.[0]?.delta?.content;
-                if (content) {
-                  assistantMessage += content;
-                  
-                  // Update message in real-time
-                  setMessages(prev => {
-                    const newMessages = [...prev];
-                    const lastMessage = newMessages[newMessages.length - 1];
-                    
-                    if (lastMessage?.role === 'assistant') {
-                      lastMessage.content = assistantMessage;
-                    } else {
-                      newMessages.push({
-                        role: 'assistant',
-                        content: assistantMessage,
-                        timestamp: Date.now(),
-                      });
-                    }
-                    
-                    return newMessages;
-                  });
-                }
-              } catch (e) {
-                // Skip invalid JSON
+            try {
+              const parsed = JSON.parse(data) as {
+                choices?: Array<{ delta?: { content?: string } }>;
+                audio?: { pcm?: string; sampleRate?: number };
+              };
+
+              if (parsed.audio?.pcm) {
+                void schedulePcmChunk(
+                  base64ToPcm(parsed.audio.pcm),
+                  parsed.audio.sampleRate ?? GEMINI_PCM_SAMPLE_RATE,
+                );
               }
+
+              const content = parsed.choices?.[0]?.delta?.content;
+              if (content) {
+                assistantMessage += content;
+
+                setMessages((prev) => {
+                  const newMessages = [...prev];
+                  const lastMessage = newMessages[newMessages.length - 1];
+
+                  if (lastMessage?.role === 'assistant') {
+                    lastMessage.content = assistantMessage;
+                  } else {
+                    newMessages.push({
+                      role: 'assistant',
+                      content: assistantMessage,
+                      timestamp: Date.now(),
+                    });
+                  }
+
+                  return newMessages;
+                });
+              }
+            } catch {
+              // Skip invalid JSON
             }
           }
         }
       }
 
-      // Foundation for ElevenLabs avatar/voice:
-      // synthesize the final AI text once streaming ends.
-      if (assistantMessage.trim()) {
-        await playElevenLabsTts(assistantMessage);
-      }
+      await endAgoraTtsSession();
+      setIsAssistantSpeaking(false);
     } catch (error) {
       console.error('Error sending message:', error);
+      await endAgoraTtsSession();
+      setIsAssistantSpeaking(false);
       alert('Failed to send message. Check console for details.');
     } finally {
       setIsLoading(false);
@@ -564,7 +634,7 @@ export default function Home() {
     <div className={styles.container}>
       <header className={styles.header}>
         <h1>Multi-Persona AI Sales Agent</h1>
-        <p>Dynamic persona adaptation • Real-time interaction</p>
+        <p>Persona-aware • Gemini Live voice • Agora RTC</p>
       </header>
 
       <main className={styles.main}>
@@ -611,13 +681,24 @@ export default function Home() {
           {isConnected && (
             <div className={styles.micControls}>
               <button
-                onClick={isListening ? stopVoiceInput : startVoiceInput}
-                className={isListening ? styles.buttonDanger : styles.button}
+                onClick={isLiveAgent ? stopLiveAgent : startLiveAgent}
+                className={isLiveAgent ? styles.buttonDanger : styles.button}
                 type="button"
               >
-                {isListening ? '🛑 Stop Voice Input' : '🎙️ Start Voice Input'}
+                {isLiveAgent ? '🛑 Stop Realtime Agent' : '⚡ Start Realtime Agent'}
               </button>
-              <span className={styles.statusPill}>{isListening ? 'Listening...' : 'Voice ready'}</span>
+              {!isLiveAgent && (
+                <button
+                  onClick={isListening ? stopVoiceInput : startVoiceInput}
+                  className={isListening ? styles.buttonDanger : styles.button}
+                  type="button"
+                >
+                  {isListening ? '🛑 Stop STT' : '🎙️ Dictate (text)'}
+                </button>
+              )}
+              <span className={styles.statusPill}>
+                {liveStatus || (isLiveAgent ? 'Realtime voice active' : isListening ? 'Dictating…' : 'Use Realtime for low latency')}
+              </span>
             </div>
           )}
         </div>
@@ -660,13 +741,15 @@ export default function Home() {
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
               onKeyPress={(e) => e.key === 'Enter' && !e.shiftKey && sendMessage()}
-              placeholder="Type your message..."
+              placeholder={
+                isLiveAgent ? 'Type to interrupt / add context…' : 'Type your message…'
+              }
               className={styles.input}
-              disabled={isLoading}
+              disabled={isLoading && !isLiveAgent}
             />
             <button
               onClick={sendMessage}
-              disabled={isLoading || !inputText.trim()}
+              disabled={(!isLiveAgent && isLoading) || !inputText.trim()}
               className={styles.sendButton}
             >
               {isLoading ? '...' : 'Send'}

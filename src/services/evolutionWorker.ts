@@ -71,7 +71,7 @@ Classify these terms: ${terms.join(', ')}
 Respond with JSON only: {"term1": "category", "term2": "category", ...}`;
     
     const result = await ai.models.generateContent({
-      model: resolveVertexModelId('gemini-2.0-flash'),
+      model: resolveVertexModelId('gemini-3.1-flash-lite'),
       contents: prompt,
       config: {
         temperature: 0.3,

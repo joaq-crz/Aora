@@ -4,12 +4,16 @@ let genaiClient: GoogleGenAI | null = null;
 
 export type GeminiAuthMode = 'vertex-express' | 'ai-studio' | 'vertex-project' | 'none';
 
+const DEFAULT_MODEL = 'gemini-3.1-flash-lite';
+
 const MODEL_ALIASES: Record<string, string> = {
-  'gemini-3.5-flash': 'gemini-2.0-flash',
-  'gemini-2.0-flash': 'gemini-2.0-flash',
-  'gemini-2.0-flash-lite': 'gemini-2.0-flash-lite',
-  'gemini-2.0-flash-001': 'gemini-2.0-flash',
-  'gemini-2.0-flash-lite-001': 'gemini-2.0-flash-lite',
+  'gemini-3.1-flash-lite': 'gemini-3.1-flash-lite',
+  'gemini-3.1-flash-lite-preview': 'gemini-3.1-flash-lite-preview',
+  'gemini-3.5-flash': DEFAULT_MODEL,
+  'gemini-2.0-flash': DEFAULT_MODEL,
+  'gemini-2.0-flash-lite': DEFAULT_MODEL,
+  'gemini-2.0-flash-001': DEFAULT_MODEL,
+  'gemini-2.0-flash-lite-001': DEFAULT_MODEL,
   'gemini-1.5-flash': 'gemini-1.5-flash',
   'gemini-1.5-pro': 'gemini-1.5-pro',
 };
@@ -65,7 +69,7 @@ export function validateVertexConfig(): { ok: true; mode: GeminiAuthMode } | { o
 }
 
 export function resolveVertexModelId(requested?: string): string {
-  const name = requested?.trim() || 'gemini-2.0-flash';
+  const name = requested?.trim() || DEFAULT_MODEL;
   return MODEL_ALIASES[name] ?? name;
 }
 
