@@ -48,16 +48,17 @@ async function classifySlangTerms(terms: string[]): Promise<Record<string, strin
   const classifications: Record<string, string> = {};
   
   try {
-    const { GoogleGenerativeAI } = await import('@google/generative-ai');
-    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
-    
-    const model = genAI.getGenerativeModel({
-      model: 'gemini-3.5-flash',
-      generationConfig: {
-        temperature: 0.3,
-        responseMimeType: 'application/json'
-      }
-    });
+    const { getGenAIClient, resolveVertexModelId, validateVertexConfig } = await import(
+      './vertexGemini'
+    );
+
+    const config = validateVertexConfig();
+    if (!config.ok) {
+      console.error('[Evolution]', config.error);
+      return classifications;
+    }
+
+    const ai = getGenAIClient();
     
     const prompt = `You are a Filipino slang classifier. Classify each term into one of these categories:
 - BGC Conyo: Upper-class Manila youth, Taglish speakers
@@ -69,9 +70,15 @@ Classify these terms: ${terms.join(', ')}
 
 Respond with JSON only: {"term1": "category", "term2": "category", ...}`;
     
-    const result = await model.generateContent(prompt);
-    const response = result.response;
-    const text = response.text();
+    const result = await ai.models.generateContent({
+      model: resolveVertexModelId('gemini-2.0-flash'),
+      contents: prompt,
+      config: {
+        temperature: 0.3,
+        responseMimeType: 'application/json',
+      },
+    });
+    const text = result.text ?? '';
     
     return JSON.parse(text);
   } catch (error) {

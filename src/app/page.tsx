@@ -1,7 +1,6 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import AgoraRTC from 'agora-rtc-sdk-ng';
 import styles from './page.module.css';
 import { agoraConfig } from '@/utils/agoraConfig';
 
@@ -28,6 +27,8 @@ export default function Home() {
   const agoraClientRef = useRef<any>(null);
   const agoraAudioTrackRef = useRef<any>(null);
   const agoraUidRef = useRef<number | null>(null);
+  const agoraAssistantTrackRef = useRef<any>(null);
+  const agoraRtcModuleRef = useRef<any>(null);
   
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -103,6 +104,142 @@ export default function Home() {
     }
   };
 
+  const publishAssistantAudioToAgora = async (blob: Blob) => {
+    const client = agoraClientRef.current;
+    if (!client) return false;
+
+    const AgoraRTC = agoraRtcModuleRef.current;
+    if (!AgoraRTC) return false;
+
+    const micTrack = agoraAudioTrackRef.current;
+
+    // Unpublish previous assistant track (if any).
+    const previousAssistantTrack = agoraAssistantTrackRef.current;
+    if (previousAssistantTrack) {
+      try {
+        await client.unpublish([previousAssistantTrack]);
+      } catch {
+        // ignore
+      }
+      try {
+        previousAssistantTrack.close?.();
+      } catch {
+        // ignore
+      }
+      agoraAssistantTrackRef.current = null;
+    }
+
+    const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
+    if (!AudioCtx) return false;
+
+    // Decode the ElevenLabs MP3 to PCM so we can stream it through Agora.
+    const arrayBuffer = await blob.arrayBuffer();
+    const audioContext = new AudioCtx();
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer.slice(0));
+
+    const source = audioContext.createBufferSource();
+    source.buffer = audioBuffer;
+
+    // Create a MediaStream from the decoded audio.
+    const streamDestination = audioContext.createMediaStreamDestination();
+    source.connect(streamDestination);
+    // Also play locally so the speaker hears the assistant.
+    source.connect(audioContext.destination);
+
+    const mediaStreamTrack = streamDestination.stream.getAudioTracks()[0];
+    if (!mediaStreamTrack) {
+      try {
+        audioContext.close?.();
+      } catch {
+        // ignore
+      }
+      return false;
+    }
+
+    const createCustomTrack = (AgoraRTC as any).createCustomAudioTrack;
+    if (!createCustomTrack) return false;
+
+    // Convert MediaStreamTrack to an Agora audio track and publish it.
+    const assistantTrack = await createCustomTrack({ mediaStreamTrack });
+    agoraAssistantTrackRef.current = assistantTrack;
+
+    try {
+      // Avoid mic echo/feedback for other listeners in the channel.
+      if (micTrack) {
+        try {
+          await client.unpublish([micTrack]);
+        } catch {
+          // ignore
+        }
+      }
+
+      await client.publish([assistantTrack]);
+    } catch (e) {
+      console.error('[Agora] assistant audio publish error:', e);
+      try {
+        assistantTrack.close?.();
+      } catch {
+        // ignore
+      }
+      agoraAssistantTrackRef.current = null;
+      try {
+        audioContext.close?.();
+      } catch {
+        // ignore
+      }
+      return false;
+    }
+
+    source.start(0);
+
+    return new Promise<boolean>((resolve) => {
+      source.onended = async () => {
+        try {
+          await client.unpublish([assistantTrack]);
+        } catch {
+          // ignore
+        }
+        try {
+          assistantTrack.close?.();
+        } catch {
+          // ignore
+        }
+        agoraAssistantTrackRef.current = null;
+
+        try {
+          // Restore mic publishing after assistant finishes.
+          if (micTrack) {
+            await client.publish([micTrack]);
+          }
+        } catch {
+          // ignore
+        }
+
+        try {
+          audioContext.close?.();
+        } catch {
+          // ignore
+        }
+        resolve(true);
+      };
+
+      source.onerror = async () => {
+        try {
+          await client.unpublish([assistantTrack]);
+        } catch {
+          // ignore
+        }
+        try {
+          assistantTrack.close?.();
+        } catch {
+          // ignore
+        }
+        agoraAssistantTrackRef.current = null;
+        resolve(false);
+      };
+    });
+  };
+
   const playElevenLabsTts = async (text: string) => {
     if (!text.trim()) return;
 
@@ -117,23 +254,29 @@ export default function Home() {
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         console.warn('[TTS] ElevenLabs not available:', err?.error ?? res.statusText);
+        setIsAssistantSpeaking(false);
         return;
       }
 
       const blob = await res.blob();
-      const audioUrl = URL.createObjectURL(blob);
-      const audio = new Audio(audioUrl);
 
-      await audio.play();
-
-      audio.onended = () => {
-        URL.revokeObjectURL(audioUrl);
+      const published = await publishAssistantAudioToAgora(blob);
+      if (!published) {
+        // Fallback: play locally if Agora publish fails.
+        const audioUrl = URL.createObjectURL(blob);
+        const audio = new Audio(audioUrl);
+        await audio.play();
+        audio.onended = () => {
+          URL.revokeObjectURL(audioUrl);
+          setIsAssistantSpeaking(false);
+        };
+        audio.onerror = () => {
+          URL.revokeObjectURL(audioUrl);
+          setIsAssistantSpeaking(false);
+        };
+      } else {
         setIsAssistantSpeaking(false);
-      };
-      audio.onerror = () => {
-        URL.revokeObjectURL(audioUrl);
-        setIsAssistantSpeaking(false);
-      };
+      }
     } catch (e) {
       console.error('[TTS] error:', e);
       setIsAssistantSpeaking(false);
@@ -146,6 +289,11 @@ export default function Home() {
     if (!agoraConfig.appId) {
       throw new Error('NEXT_PUBLIC_AGORA_APP_ID missing');
     }
+
+    const AgoraRTC =
+      agoraRtcModuleRef.current ??
+      (await import('agora-rtc-sdk-ng')).default;
+    agoraRtcModuleRef.current = AgoraRTC;
 
     const uid = getAgoraUid();
     agoraUidRef.current = uid;

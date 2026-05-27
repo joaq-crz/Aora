@@ -18,6 +18,7 @@ const requiredFiles = [
   'src/services/profileManager.ts',
   'src/services/promptCompiler.ts',
   'src/services/evolutionWorker.ts',
+  'src/services/vertexGemini.ts',
   'src/types/chat.ts',
   'src/utils/agoraConfig.ts',
   'src/app/page.tsx',
@@ -75,13 +76,15 @@ if (envLocal) {
   
   // Check if keys are configured
   const envContent = fs.readFileSync(path.join(__dirname, '..', '.env.local'), 'utf-8');
-  const hasOpenAI = envContent.includes('OPENAI_API_KEY=') && !envContent.includes('your_openai_api_key_here');
+  const hasVertex =
+    envContent.includes('GOOGLE_CLOUD_PROJECT=') &&
+    !envContent.includes('your-gcp-project-id');
   const hasAgora = envContent.includes('NEXT_PUBLIC_AGORA_APP_ID=') && !envContent.includes('your_agora_app_id_here');
   
-  if (hasOpenAI) {
-    console.log('  ✅ OpenAI API key configured');
+  if (hasVertex) {
+    console.log('  ✅ Vertex AI (GOOGLE_CLOUD_PROJECT) configured');
   } else {
-    console.log('  ⚠️  OpenAI API key not configured');
+    console.log('  ⚠️  Vertex AI project not configured (GOOGLE_CLOUD_PROJECT)');
   }
   
   if (hasAgora) {
@@ -90,7 +93,7 @@ if (envLocal) {
     console.log('  ⚠️  Agora App ID not configured');
   }
   
-  checks.push({ name: 'Environment Variables', passed: hasOpenAI && hasAgora });
+  checks.push({ name: 'Environment Variables', passed: hasVertex && hasAgora });
 } else {
   console.log('  ⚠️  .env.local not found - copy from .env.local.example');
   checks.push({ name: 'Environment Variables', passed: false });
