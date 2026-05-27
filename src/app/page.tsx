@@ -34,7 +34,10 @@ export default function Home() {
         const recognition = new SpeechRecognition();
         recognition.continuous = true;
         recognition.interimResults = true;
-        recognition.lang = 'en-US'; // Can also use 'tl-PH' for Tagalog
+        recognition.lang = 'en-US';
+        
+        let finalTranscriptBuffer = '';
+        let silenceTimer: NodeJS.Timeout;
         
         recognition.onresult = (event: any) => {
           let interimTranscript = '';
@@ -50,8 +53,25 @@ export default function Home() {
           }
           
           if (finalTranscript) {
-            setInputText(prev => prev + finalTranscript);
+            finalTranscriptBuffer += finalTranscript;
+            setInputText(finalTranscriptBuffer.trim());
             setTranscript('');
+            
+            // Clear existing timer
+            if (silenceTimer) clearTimeout(silenceTimer);
+            
+            // Auto-send after 2 seconds of silence
+            silenceTimer = setTimeout(() => {
+              if (finalTranscriptBuffer.trim()) {
+                console.log('[Voice] Auto-sending:', finalTranscriptBuffer.trim());
+                // Trigger send
+                const sendButton = document.querySelector('[data-send-button]') as HTMLButtonElement;
+                if (sendButton) {
+                  sendButton.click();
+                }
+                finalTranscriptBuffer = '';
+              }
+            }, 2000);
           } else {
             setTranscript(interimTranscript);
           }
@@ -66,7 +86,11 @@ export default function Home() {
         
         recognition.onend = () => {
           if (isListening) {
-            recognition.start(); // Restart if still supposed to be listening
+            try {
+              recognition.start();
+            } catch (e) {
+              console.log('Recognition restart failed, will retry');
+            }
           }
         };
         
@@ -96,6 +120,19 @@ export default function Home() {
 
       // Start periodic frame capture for vision analysis
       startFrameCapture();
+      
+      // Auto-start voice recognition
+      setTimeout(() => {
+        if (recognitionRef.current) {
+          try {
+            recognitionRef.current.start();
+            setIsListening(true);
+            console.log('[Voice] Auto-started voice recognition');
+          } catch (error) {
+            console.error('Error auto-starting recognition:', error);
+          }
+        }
+      }, 500);
     } catch (error) {
       console.error('Error starting media:', error);
       alert('Failed to access camera/microphone. Please check permissions and use HTTPS or localhost.');
@@ -165,13 +202,18 @@ export default function Home() {
       videoRef.current.srcObject = null;
     }
     
-    if (isListening && recognitionRef.current) {
-      recognitionRef.current.stop();
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch (e) {
+        console.log('Recognition already stopped');
+      }
       setIsListening(false);
     }
     
     setIsConnected(false);
     setLastCapturedFrame(null);
+    setTranscript('');
 
     if (captureIntervalRef.current) {
       clearInterval(captureIntervalRef.current);
@@ -196,17 +238,18 @@ export default function Home() {
     };
 
     setMessages(prev => [...prev, userMessage]);
+    const messageToSend = inputText;
     setInputText('');
     setIsLoading(true);
 
     try {
       // Prepare message content (text + optional image)
-      let messageContent: any = inputText;
+      let messageContent: any = messageToSend;
       
       if (lastCapturedFrame && isConnected) {
         // Include image for multimodal analysis
         messageContent = [
-          { type: 'text', text: inputText },
+          { type: 'text', text: messageToSend },
           { type: 'image_url', image_url: { url: lastCapturedFrame } }
         ];
       }
@@ -287,6 +330,10 @@ export default function Home() {
           }
         }
       }
+      
+      // After AI responds, restart voice recognition if it was active
+      console.log('[Voice] AI finished responding, ready for next input');
+      
     } catch (error) {
       console.error('Error sending message:', error);
       alert('Failed to send message. Check console for details.');
@@ -327,28 +374,22 @@ export default function Home() {
                 🎥 Start Camera & Mic
               </button>
             ) : (
-              <>
-                <button onClick={stopLocalMedia} className={styles.buttonDanger}>
-                  ⏹️ Stop Camera & Mic
-                </button>
-                <button 
-                  onClick={toggleVoiceRecognition} 
-                  className={isListening ? styles.buttonDanger : styles.button}
-                >
-                  {isListening ? '🔴 Stop Listening' : '🎤 Start Voice Input'}
-                </button>
-              </>
+              <button onClick={stopLocalMedia} className={styles.buttonDanger}>
+                ⏹️ Stop Camera & Mic
+              </button>
             )}
           </div>
           
-          {isConnected && lastCapturedFrame && (
-            <p className={styles.statusText}>✅ Camera active • Capturing frames</p>
+          {isConnected && (
+            <p className={styles.statusText}>
+              ✅ Camera active • {isListening ? (isLoading ? '⏸️ AI responding...' : '🎤 Listening...') : 'Ready'}
+            </p>
           )}
           
-          {isListening && (
+          {isListening && transcript && !isLoading && (
             <div className={styles.listeningIndicator}>
               <span className={styles.pulse}>🎤</span>
-              <span>Listening... {transcript && `"${transcript}"`}</span>
+              <span>"{transcript}"</span>
             </div>
           )}
         </div>
@@ -358,7 +399,9 @@ export default function Home() {
             {messages.length === 0 && (
               <div className={styles.emptyState}>
                 <p>Start a conversation with the AI agent</p>
-                <p className={styles.hint}>Type or speak: "Hello broskie"</p>
+                <p className={styles.hint}>
+                  {isListening ? '🎤 Just start speaking!' : 'Click "Start Camera & Mic" and speak!'}
+                </p>
               </div>
             )}
             
@@ -391,14 +434,16 @@ export default function Home() {
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
               onKeyPress={(e) => e.key === 'Enter' && !e.shiftKey && sendMessage()}
-              placeholder={isListening ? "Listening... or type here" : "Type your message..."}
+              placeholder={isListening ? "🎤 Listening... or type here" : "Type your message..."}
               className={styles.input}
               disabled={isLoading}
+              style={{ opacity: isLoading ? 0.5 : 1 }}
             />
             <button
               onClick={sendMessage}
               disabled={isLoading || !inputText.trim()}
               className={styles.sendButton}
+              data-send-button
             >
               {isLoading ? '...' : 'Send'}
             </button>
