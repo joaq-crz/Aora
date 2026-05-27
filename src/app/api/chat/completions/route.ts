@@ -120,17 +120,11 @@ export async function POST(req: NextRequest) {
         };
       });
     
-    // Initialize Gemini model with system instruction
-    const model = genAI.getGenerativeModel({
-      model: 'gemini-3.5-flash',
-      systemInstruction: systemPrompt,
-      generationConfig: {
-        temperature: body.temperature || 0.8,
-        maxOutputTokens: body.max_tokens || 500,
-      }
-    });
+    const requestedModel = body.model || 'gemini-3.5-flash';
+    const fallbackModel = requestedModel === 'gemini-3.5-flash' ? 'gemini-2.0-flash' : 'gemini-2.0-flash-lite';
     
-    console.log('[API] Initialized Gemini 3.5 Flash model for user:', userId);
+    console.log('[API] Requested model:', requestedModel);
+    console.log('[API] Fallback model:', fallbackModel);
     console.log('[API] Message count:', geminiMessages.length);
     
     // Create SSE stream
@@ -139,18 +133,43 @@ export async function POST(req: NextRequest) {
     
     const stream = new ReadableStream({
       async start(controller) {
-        try {
-          console.log('[API] Starting Gemini stream...');
-          
-          // Start streaming chat
+        const sendStreamWithModel = async (modelName: string) => {
+          const model = genAI.getGenerativeModel({
+            model: modelName,
+            systemInstruction: systemPrompt,
+            generationConfig: {
+              temperature: body.temperature || 0.8,
+              maxOutputTokens: body.max_tokens || 500,
+            }
+          });
+
           const chat = model.startChat({
             history: geminiMessages.slice(0, -1), // All but last message
           });
           
           const lastMessage = geminiMessages[geminiMessages.length - 1];
-          console.log('[API] Sending message to Gemini:', lastMessage.parts[0]);
-          
-          const result = await chat.sendMessageStream(lastMessage.parts);
+          console.log(`[API] Sending message to Gemini (${modelName}):`, lastMessage.parts[0]);
+          return await chat.sendMessageStream(lastMessage.parts);
+        };
+
+        try {
+          console.log('[API] Starting Gemini stream...');
+
+          let result;
+          let activeModel = requestedModel;
+          try {
+            result = await sendStreamWithModel(requestedModel);
+          } catch (primaryError: any) {
+            const msg = String(primaryError?.message || primaryError || '');
+            const isCapacityError = msg.includes('503') || msg.toLowerCase().includes('high demand');
+            if (!isCapacityError) {
+              throw primaryError;
+            }
+
+            console.warn(`[API] Model ${requestedModel} unavailable, retrying with ${fallbackModel}`);
+            activeModel = fallbackModel;
+            result = await sendStreamWithModel(fallbackModel);
+          }
           
           // Stream chunks
           for await (const chunk of result.stream) {
@@ -171,6 +190,7 @@ export async function POST(req: NextRequest) {
               controller.enqueue(encoder.encode(`data: ${JSON.stringify(sseData)}\n\n`));
             }
           }
+          console.log('[API] Stream complete using model:', activeModel);
           
           // Send completion
           controller.enqueue(encoder.encode('data: [DONE]\n\n'));

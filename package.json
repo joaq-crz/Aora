@@ -10,10 +10,12 @@
     "verify": "node scripts/test-setup.js"
   },
   "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "agora-access-token": "^2.0.4",
+    "agora-rtc-sdk-ng": "^4.24.3",
     "next": "^14.2.0",
     "react": "^18.3.0",
-    "react-dom": "^18.3.0",
-    "@google/generative-ai": "^0.21.0"
+    "react-dom": "^18.3.0"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
