@@ -17,10 +17,65 @@ export default function Home() {
   const [isLoading, setIsLoading] = useState(false);
   const [userId] = useState(() => `user_${Date.now()}`);
   const [lastCapturedFrame, setLastCapturedFrame] = useState<string | null>(null);
+  const [isListening, setIsListening] = useState(false);
+  const [transcript, setTranscript] = useState('');
   
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const captureIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const recognitionRef = useRef<any>(null);
+
+  // Initialize speech recognition
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      
+      if (SpeechRecognition) {
+        const recognition = new SpeechRecognition();
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.lang = 'en-US'; // Can also use 'tl-PH' for Tagalog
+        
+        recognition.onresult = (event: any) => {
+          let interimTranscript = '';
+          let finalTranscript = '';
+          
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            const transcript = event.results[i][0].transcript;
+            if (event.results[i].isFinal) {
+              finalTranscript += transcript + ' ';
+            } else {
+              interimTranscript += transcript;
+            }
+          }
+          
+          if (finalTranscript) {
+            setInputText(prev => prev + finalTranscript);
+            setTranscript('');
+          } else {
+            setTranscript(interimTranscript);
+          }
+        };
+        
+        recognition.onerror = (event: any) => {
+          console.error('Speech recognition error:', event.error);
+          if (event.error === 'no-speech') {
+            console.log('No speech detected, continuing...');
+          }
+        };
+        
+        recognition.onend = () => {
+          if (isListening) {
+            recognition.start(); // Restart if still supposed to be listening
+          }
+        };
+        
+        recognitionRef.current = recognition;
+      } else {
+        console.warn('Speech recognition not supported in this browser');
+      }
+    }
+  }, [isListening]);
 
   // Start local video/audio using native browser APIs
   const startLocalMedia = async () => {
@@ -44,6 +99,27 @@ export default function Home() {
     } catch (error) {
       console.error('Error starting media:', error);
       alert('Failed to access camera/microphone. Please check permissions and use HTTPS or localhost.');
+    }
+  };
+
+  // Toggle voice recognition
+  const toggleVoiceRecognition = () => {
+    if (!recognitionRef.current) {
+      alert('Speech recognition not supported in this browser. Please use Chrome or Edge.');
+      return;
+    }
+    
+    if (isListening) {
+      recognitionRef.current.stop();
+      setIsListening(false);
+      setTranscript('');
+    } else {
+      try {
+        recognitionRef.current.start();
+        setIsListening(true);
+      } catch (error) {
+        console.error('Error starting recognition:', error);
+      }
     }
   };
 
@@ -75,7 +151,7 @@ export default function Home() {
     const base64Image = canvas.toDataURL('image/jpeg', 0.8);
     setLastCapturedFrame(base64Image);
     
-    console.log('[Camera] Frame captured:', base64Image.substring(0, 50) + '...');
+    console.log('[Camera] Frame captured');
   };
 
   // Stop local media
@@ -87,6 +163,11 @@ export default function Home() {
     
     if (videoRef.current) {
       videoRef.current.srcObject = null;
+    }
+    
+    if (isListening && recognitionRef.current) {
+      recognitionRef.current.stop();
+      setIsListening(false);
     }
     
     setIsConnected(false);
@@ -246,14 +327,30 @@ export default function Home() {
                 🎥 Start Camera & Mic
               </button>
             ) : (
-              <button onClick={stopLocalMedia} className={styles.buttonDanger}>
-                ⏹️ Stop Camera & Mic
-              </button>
-            )}
-            {isConnected && lastCapturedFrame && (
-              <p className={styles.statusText}>✅ Camera active • Capturing frames</p>
+              <>
+                <button onClick={stopLocalMedia} className={styles.buttonDanger}>
+                  ⏹️ Stop Camera & Mic
+                </button>
+                <button 
+                  onClick={toggleVoiceRecognition} 
+                  className={isListening ? styles.buttonDanger : styles.button}
+                >
+                  {isListening ? '🔴 Stop Listening' : '🎤 Start Voice Input'}
+                </button>
+              </>
             )}
           </div>
+          
+          {isConnected && lastCapturedFrame && (
+            <p className={styles.statusText}>✅ Camera active • Capturing frames</p>
+          )}
+          
+          {isListening && (
+            <div className={styles.listeningIndicator}>
+              <span className={styles.pulse}>🎤</span>
+              <span>Listening... {transcript && `"${transcript}"`}</span>
+            </div>
+          )}
         </div>
 
         <div className={styles.chatSection}>
@@ -261,7 +358,7 @@ export default function Home() {
             {messages.length === 0 && (
               <div className={styles.emptyState}>
                 <p>Start a conversation with the AI agent</p>
-                <p className={styles.hint}>Try: "Hello broskie"</p>
+                <p className={styles.hint}>Type or speak: "Hello broskie"</p>
               </div>
             )}
             
@@ -294,7 +391,7 @@ export default function Home() {
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
               onKeyPress={(e) => e.key === 'Enter' && !e.shiftKey && sendMessage()}
-              placeholder="Type your message..."
+              placeholder={isListening ? "Listening... or type here" : "Type your message..."}
               className={styles.input}
               disabled={isLoading}
             />
